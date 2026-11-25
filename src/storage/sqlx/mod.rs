@@ -37,6 +37,8 @@ mod broadcast_seen;
 #[cfg(test)]
 mod broadcaster_hint_tests;
 mod create_action;
+#[cfg(test)]
+mod ingest_batch_tests;
 mod internalize_action;
 mod invalid_beside_proof;
 mod locked_inputs;
@@ -90,7 +92,7 @@ pub use proof_root_checks::{
     MIGRATION_005_PROOF_ROOT_CHECKS_NAME, MIGRATION_005_PROOF_ROOT_CHECKS_SQL,
 };
 pub use storage_sqlx::{
-    RetireOutcome, StorageSqlx, UnprovenAdoption, ADOPT_UNPROVEN_TX_LIMIT,
-    DEFAULT_MAX_OUTPUT_SCRIPT, STORE_BUSY_CEILING_MS,
+    ProofToIngest, RetireOutcome, StorageSqlx, UnprovenAdoption, ADOPT_UNPROVEN_TX_LIMIT,
+    DEFAULT_MAX_OUTPUT_SCRIPT, INGEST_PROOFS_PER_WRITE, STORE_BUSY_CEILING_MS,
 };
 pub use sync::entity_names;

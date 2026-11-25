@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `StorageSqlx::ingest_merkle_proofs` stores many merkle proofs, each exactly as `ingest_merkle_proof` stores it (the same outcome per proof, the same rows), with fewer trips to the store: the proof gate is read once, the chain tracker is asked once per (root, height), so a block's proofs cost one answer, and the stores and record completions run in one write transaction per `INGEST_PROOFS_PER_WRITE` (200) proofs instead of one per proof. `ingest_merkle_proof` is a batch of one. A store error fails the call; the write it happened in is rolled back and the writes before it stay (`a_batch_writes_what_one_proof_at_a_time_writes`, `a_blocks_proofs_ask_the_tracker_once`, `proofs_past_one_write_are_all_stored`).
+
 ### Fixed
 
 - A store's `find_or_insert_user` answers every caller at once for an identity it does not hold (two managers over one store, a wallet and a manager, two tasks of one host): in one write transaction the user's row is inserted only if absent and then read, so every caller is answered the same row, exactly one is told it is new, and that one writes the user's default basket. Before, a caller whose insert followed another's was answered `SQLx error: error returned from database: (code: 2067) UNIQUE constraint failed: users.identity_key` (`callers_at_once_for_one_new_identity_are_all_answered_one_row`).

@@ -55,8 +55,8 @@ pub use broadcast::{
 pub use sqlx::{
     chain_knowledge, locked_input_backoff_minutes, utxo_verdict, ChainKnowledge,
     InternalizedPhantom, LockedInputCheck, LockedInputReport, LockedInputVerdict, PoisonOutcome,
-    PoisonReport, PoisonedTx, RetireOutcome, SqlxBroadcastMemory, StorageSqlx, UtxoVerdict,
-    DEFAULT_ABSENCE_MINUTES,
+    PoisonReport, PoisonedTx, ProofToIngest, RetireOutcome, SqlxBroadcastMemory, StorageSqlx,
+    UtxoVerdict, DEFAULT_ABSENCE_MINUTES, INGEST_PROOFS_PER_WRITE,
 };
 
 #[cfg(feature = "remote")]

@@ -3171,6 +3171,8 @@ impl StorageSqlx {
     /// `header_merkle_root` is stored when provided (e.g. from a block header
     /// lookup); otherwise the computed root — which the ChainTracker just
     /// validated — is stored.
+    ///
+    /// One proof is a batch of one: see [`Self::ingest_merkle_proofs`].
     pub async fn ingest_merkle_proof(
         &self,
         txid: &str,
@@ -3179,172 +3181,284 @@ impl StorageSqlx {
         block_hash: &str,
         header_merkle_root: Option<&str>,
     ) -> Result<ProofIngestOutcome> {
-        let bump = match MerklePath::from_binary(merkle_path_bytes) {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(ProofIngestOutcome::InvalidProof(format!(
-                    "failed to parse merkle path: {}",
-                    e
-                )))
-            }
-        };
-
-        let computed_root = match bump.compute_root(Some(txid)) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ProofIngestOutcome::InvalidProof(format!(
-                    "failed to compute merkle root: {}",
-                    e
-                )))
-            }
-        };
-
-        // The proof LAG gate (ts-stack `TaskCheckForProofs.maxAcceptableHeight`):
-        // a proof for a block newer than the last header the monitor watched
-        // stay the chain tip for a full cycle is DEFERRED, never stored and
-        // never an attempt. This is what keeps an orphan's proof out of
-        // `proven_txs` (2026-09-07: a 34 MB block at 965771 lost to a 58-tx
-        // block within seconds, and Arcade's inline proofs had arrived 5 s
-        // after the block). The gate is ONE persisted row (migration 004)
-        // that every instance and process reads; absent or 0 is CLOSED. This
-        // early read only spares the tracker call: the funnel below re-reads
-        // the gate on the write connection and is the authority.
-        let processed_height = self.max_acceptable_proof_height().await?;
-        if block_height > processed_height {
-            tracing::debug!(
-                txid = %txid,
-                block_height,
-                processed_height,
-                marker = "proof_deferred_above_processed_height",
-                "ingest_merkle_proof: deferred until the header has aged one cycle"
-            );
-            return Ok(ProofIngestOutcome::DeferredAboveProcessedHeight {
-                block_height,
-                processed_height,
-            });
-        }
-
-        // Layer 1: Validate the merkle proof before storing. Bad proofs
-        // (e.g. from provider rate limiting) are rejected instead of stored
-        // permanently. No tracker, no proof (P0-1): the reference cannot
-        // reach a store without one, its `getChainTracker` throws when none
-        // is configured (ts-stack@fb1b2da
-        // packages/wallet/wallet-toolbox/src/services/Services.ts:267-275).
-        let Some(tracker) = self.get_chain_tracker().await else {
-            tracing::error!(
-                txid = %txid,
-                block_height,
-                marker = "proof_refused_no_chain_tracker",
-                "ingest_merkle_proof: no ChainTracker is wired, so the merkle root cannot be checked against the active chain; the proof was NOT stored and the transaction stays unproven"
-            );
-            return Ok(ProofIngestOutcome::TrackerUnavailable);
-        };
-        match tracker
-            .is_valid_root_for_height(&computed_root, block_height)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(ProofIngestOutcome::InvalidMerkleRoot { computed_root });
-            }
-            Err(e) => {
-                return Ok(ProofIngestOutcome::TrackerError(e.to_string()));
-            }
-        }
-
-        let merkle_root = header_merkle_root
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| computed_root.clone());
-
-        // ONE funnel for every proof store (`store_validated_proof_on`): the
-        // gate read on the write connection, replace-on-differ (ts-stack
-        // `internalizeAction`: "in the event of a reorg, the proof in this
-        // beef should replace the proof in storage"; Arcade's `reorg_reanchor`
-        // MINED is the same message), the no-raw guard and the empty-hash
-        // backfill, in one transaction with the record completion below.
-        let mut tx = self.write_tx().await?;
-        let stored = store_validated_proof_on(
-            &mut tx,
-            &ValidatedProofRow {
+        let mut outcomes = self
+            .ingest_merkle_proofs(&[ProofToIngest {
                 txid,
-                block_height,
-                checked_root: &computed_root,
-                block_hash,
-                merkle_root: &merkle_root,
                 merkle_path: merkle_path_bytes,
-                idx: bump_leaf_index(&bump, txid),
-                raw_tx: None,
-            },
-        )
-        .await?;
-        let proven_tx_id = match stored {
-            StoreProofOutcome::Deferred {
                 block_height,
-                processed_height,
-            } => {
-                tx.rollback().await?;
-                return Ok(ProofIngestOutcome::DeferredAboveProcessedHeight {
-                    block_height,
-                    processed_height,
-                });
-            }
-            StoreProofOutcome::NoRawTx => {
-                // `INSERT OR IGNORE` also swallows a NOT NULL violation, so a
-                // proof for a transaction whose raw bytes are nowhere in
-                // storage used to report `Ingested` while storing nothing and
-                // then complete the request with no proof link. Say so
-                // instead; nothing is latched.
-                tx.rollback().await?;
-                tracing::warn!(
-                    txid = %txid,
-                    block_height,
-                    marker = "proof_not_stored_no_raw_tx",
-                    "ingest_merkle_proof: no raw transaction bytes in storage; the proof was not stored"
-                );
-                return Ok(ProofIngestOutcome::InvalidProof(format!(
-                    "proof for {} not stored: no raw transaction bytes in storage",
-                    txid
-                )));
-            }
-            StoreProofOutcome::Stored { proven_tx_id, .. }
-            | StoreProofOutcome::Unchanged { proven_tx_id } => proven_tx_id,
-        };
-        let now = chrono::Utc::now();
-
-        // Update proven_tx_req to completed
-        sqlx::query(
-            r#"
-            UPDATE proven_tx_reqs
-            SET status = 'completed', proven_tx_id = ?, updated_at = ?
-            WHERE txid = ?
-            "#,
-        )
-        .bind(proven_tx_id)
-        .bind(now)
-        .bind(txid)
-        .execute(&mut *tx)
-        .await?;
-
-        // Update transaction status to completed and link proof
-        sqlx::query(
-            "UPDATE transactions SET status = 'completed', proven_tx_id = ?, updated_at = ? WHERE txid = ?"
-        )
-        .bind(proven_tx_id)
-        .bind(now)
-        .bind(txid)
-        .execute(&mut *tx)
-        .await?;
-        commit(tx).await?;
-
-        Ok(ProofIngestOutcome::Ingested(TxSynchronizedStatus {
-            txid: txid.to_string(),
-            status: ProvenTxReqStatus::Completed,
-            block_height: Some(block_height),
-            block_hash: Some(block_hash.to_string()),
-            merkle_root: Some(merkle_root),
-            merkle_path: Some(merkle_path_bytes.to_vec()),
-        }))
+                block_hash,
+                header_merkle_root,
+            }])
+            .await?;
+        outcomes.pop().ok_or_else(|| {
+            Error::DatabaseError("ingest_merkle_proofs answered no outcome for one proof".into())
+        })
     }
+
+    /// Validate and store many merkle proofs, each exactly as
+    /// [`Self::ingest_merkle_proof`] would, with fewer trips to the store:
+    ///
+    /// - the proof LAG gate is read once, before any write;
+    /// - the ChainTracker is asked once per (root, height): the proofs of one
+    ///   block share their root, so a block's proofs cost one answer;
+    /// - the stores and record completions run in one write transaction per
+    ///   [`INGEST_PROOFS_PER_WRITE`] validated proofs, each through the same
+    ///   funnel (`store_validated_proof_on`), so a proof's rows are what the
+    ///   one-proof path writes.
+    ///
+    /// The answer holds one outcome per proof, in the order given. A proof
+    /// the funnel defers or finds no raw bytes for writes nothing and leaves
+    /// the other proofs of its write in place. A store error fails the call:
+    /// the write it happened in is rolled back, and the writes before it stay
+    /// committed (each of their proofs is complete on its own).
+    pub async fn ingest_merkle_proofs(
+        &self,
+        proofs: &[ProofToIngest<'_>],
+    ) -> Result<Vec<ProofIngestOutcome>> {
+        let mut outcomes: Vec<Option<ProofIngestOutcome>> = vec![None; proofs.len()];
+        // (index into `proofs`, parsed BUMP, root it computes for the txid)
+        let mut validated: Vec<(usize, MerklePath, String)> = Vec::new();
+        let mut processed_height: Option<u32> = None;
+        let mut tracker: Option<Option<Arc<dyn ChainTracker>>> = None;
+        let mut root_answers: HashMap<(String, u32), std::result::Result<bool, String>> =
+            HashMap::new();
+
+        for (i, p) in proofs.iter().enumerate() {
+            let bump = match MerklePath::from_binary(p.merkle_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    outcomes[i] = Some(ProofIngestOutcome::InvalidProof(format!(
+                        "failed to parse merkle path: {}",
+                        e
+                    )));
+                    continue;
+                }
+            };
+            let computed_root = match bump.compute_root(Some(p.txid)) {
+                Ok(r) => r,
+                Err(e) => {
+                    outcomes[i] = Some(ProofIngestOutcome::InvalidProof(format!(
+                        "failed to compute merkle root: {}",
+                        e
+                    )));
+                    continue;
+                }
+            };
+
+            // The proof LAG gate (ts-stack `TaskCheckForProofs.maxAcceptableHeight`):
+            // a proof for a block newer than the last header the monitor watched
+            // stay the chain tip for a full cycle is DEFERRED, never stored and
+            // never an attempt. This is what keeps an orphan's proof out of
+            // `proven_txs` (2026-09-07: a 34 MB block at 965771 lost to a 58-tx
+            // block within seconds, and Arcade's inline proofs had arrived 5 s
+            // after the block). The gate is ONE persisted row (migration 004)
+            // that every instance and process reads; absent or 0 is CLOSED. This
+            // early read (once per call) only spares the tracker call: the funnel
+            // below re-reads the gate on the write connection and is the authority.
+            let gate = match processed_height {
+                Some(h) => h,
+                None => {
+                    let h = self.max_acceptable_proof_height().await?;
+                    processed_height = Some(h);
+                    h
+                }
+            };
+            if p.block_height > gate {
+                tracing::debug!(
+                    txid = %p.txid,
+                    block_height = p.block_height,
+                    processed_height = gate,
+                    marker = "proof_deferred_above_processed_height",
+                    "ingest_merkle_proof: deferred until the header has aged one cycle"
+                );
+                outcomes[i] = Some(ProofIngestOutcome::DeferredAboveProcessedHeight {
+                    block_height: p.block_height,
+                    processed_height: gate,
+                });
+                continue;
+            }
+
+            // Layer 1: Validate the merkle proof before storing. Bad proofs
+            // (e.g. from provider rate limiting) are rejected instead of stored
+            // permanently. No tracker, no proof (P0-1): the reference cannot
+            // reach a store without one, its `getChainTracker` throws when none
+            // is configured (ts-stack@fb1b2da
+            // packages/wallet/wallet-toolbox/src/services/Services.ts:267-275).
+            let wired = match &tracker {
+                Some(t) => t.clone(),
+                None => {
+                    let t = self.get_chain_tracker().await;
+                    tracker = Some(t.clone());
+                    t
+                }
+            };
+            let Some(wired) = wired else {
+                tracing::error!(
+                    txid = %p.txid,
+                    block_height = p.block_height,
+                    marker = "proof_refused_no_chain_tracker",
+                    "ingest_merkle_proof: no ChainTracker is wired, so the merkle root cannot be checked against the active chain; the proof was NOT stored and the transaction stays unproven"
+                );
+                outcomes[i] = Some(ProofIngestOutcome::TrackerUnavailable);
+                continue;
+            };
+            let key = (computed_root.clone(), p.block_height);
+            let answer = match root_answers.get(&key) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = wired
+                        .is_valid_root_for_height(&computed_root, p.block_height)
+                        .await
+                        .map_err(|e| e.to_string());
+                    root_answers.insert(key, a.clone());
+                    a
+                }
+            };
+            match answer {
+                Ok(true) => validated.push((i, bump, computed_root)),
+                Ok(false) => {
+                    outcomes[i] = Some(ProofIngestOutcome::InvalidMerkleRoot { computed_root });
+                }
+                Err(e) => outcomes[i] = Some(ProofIngestOutcome::TrackerError(e)),
+            }
+        }
+
+        for chunk in validated.chunks(INGEST_PROOFS_PER_WRITE) {
+            // ONE funnel for every proof store (`store_validated_proof_on`): the
+            // gate read on the write connection, replace-on-differ (ts-stack
+            // `internalizeAction`: "in the event of a reorg, the proof in this
+            // beef should replace the proof in storage"; Arcade's `reorg_reanchor`
+            // MINED is the same message), the no-raw guard and the empty-hash
+            // backfill, in one transaction with the record completions below.
+            let mut tx = self.write_tx().await?;
+            for (i, bump, computed_root) in chunk {
+                let p = &proofs[*i];
+                let merkle_root = p
+                    .header_merkle_root
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| computed_root.clone());
+                let stored = store_validated_proof_on(
+                    &mut tx,
+                    &ValidatedProofRow {
+                        txid: p.txid,
+                        block_height: p.block_height,
+                        checked_root: computed_root,
+                        block_hash: p.block_hash,
+                        merkle_root: &merkle_root,
+                        merkle_path: p.merkle_path,
+                        idx: bump_leaf_index(bump, p.txid),
+                        raw_tx: None,
+                    },
+                )
+                .await?;
+                // A deferred or byte-less proof wrote nothing (the funnel
+                // returns before its first write), so the write goes on
+                // with the other proofs.
+                let proven_tx_id = match stored {
+                    StoreProofOutcome::Deferred {
+                        block_height,
+                        processed_height,
+                    } => {
+                        outcomes[*i] = Some(ProofIngestOutcome::DeferredAboveProcessedHeight {
+                            block_height,
+                            processed_height,
+                        });
+                        continue;
+                    }
+                    StoreProofOutcome::NoRawTx => {
+                        // `INSERT OR IGNORE` also swallows a NOT NULL violation, so a
+                        // proof for a transaction whose raw bytes are nowhere in
+                        // storage used to report `Ingested` while storing nothing and
+                        // then complete the request with no proof link. Say so
+                        // instead; nothing is latched.
+                        tracing::warn!(
+                            txid = %p.txid,
+                            block_height = p.block_height,
+                            marker = "proof_not_stored_no_raw_tx",
+                            "ingest_merkle_proof: no raw transaction bytes in storage; the proof was not stored"
+                        );
+                        outcomes[*i] = Some(ProofIngestOutcome::InvalidProof(format!(
+                            "proof for {} not stored: no raw transaction bytes in storage",
+                            p.txid
+                        )));
+                        continue;
+                    }
+                    StoreProofOutcome::Stored { proven_tx_id, .. }
+                    | StoreProofOutcome::Unchanged { proven_tx_id } => proven_tx_id,
+                };
+                let now = chrono::Utc::now();
+
+                // Update proven_tx_req to completed
+                sqlx::query(
+                    r#"
+                    UPDATE proven_tx_reqs
+                    SET status = 'completed', proven_tx_id = ?, updated_at = ?
+                    WHERE txid = ?
+                    "#,
+                )
+                .bind(proven_tx_id)
+                .bind(now)
+                .bind(p.txid)
+                .execute(&mut *tx)
+                .await?;
+
+                // Update transaction status to completed and link proof
+                sqlx::query(
+                    "UPDATE transactions SET status = 'completed', proven_tx_id = ?, updated_at = ? WHERE txid = ?"
+                )
+                .bind(proven_tx_id)
+                .bind(now)
+                .bind(p.txid)
+                .execute(&mut *tx)
+                .await?;
+
+                outcomes[*i] = Some(ProofIngestOutcome::Ingested(TxSynchronizedStatus {
+                    txid: p.txid.to_string(),
+                    status: ProvenTxReqStatus::Completed,
+                    block_height: Some(p.block_height),
+                    block_hash: Some(p.block_hash.to_string()),
+                    merkle_root: Some(merkle_root),
+                    merkle_path: Some(p.merkle_path.to_vec()),
+                }));
+            }
+            commit(tx).await?;
+        }
+
+        outcomes
+            .into_iter()
+            .map(|o| {
+                o.ok_or_else(|| {
+                    Error::DatabaseError(
+                        "ingest_merkle_proofs left a proof without an outcome".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+/// The validated proofs [`StorageSqlx::ingest_merkle_proofs`] stores in one
+/// write transaction. A block's worth of proofs takes several writes, so a
+/// `createAction` waiting on the writer waits for one write of this many, not
+/// for the block (about 9 statements a proof).
+pub const INGEST_PROOFS_PER_WRITE: usize = 200;
+
+/// One proof for [`StorageSqlx::ingest_merkle_proofs`]: the arguments of
+/// [`StorageSqlx::ingest_merkle_proof`].
+#[derive(Debug, Clone, Copy)]
+pub struct ProofToIngest<'a> {
+    /// The proven transaction.
+    pub txid: &'a str,
+    /// The BUMP, binary.
+    pub merkle_path: &'a [u8],
+    /// The block the BUMP proves the transaction in.
+    pub block_height: u32,
+    /// That block's hash.
+    pub block_hash: &'a str,
+    /// The block header's merkle root when the caller read it; otherwise
+    /// the root the BUMP computes (which the ChainTracker validated) is
+    /// stored.
+    pub header_merkle_root: Option<&'a str>,
 }
 
 /// Upper bound on the proof-less `transactions` rows ONE

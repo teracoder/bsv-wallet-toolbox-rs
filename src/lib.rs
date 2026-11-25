@@ -89,8 +89,8 @@ pub use storage::{classify_broadcast_results, BroadcastOutcome};
 pub use storage::{
     chain_knowledge, locked_input_backoff_minutes, utxo_verdict, ChainKnowledge,
     InternalizedPhantom, LockedInputCheck, LockedInputReport, LockedInputVerdict, PoisonOutcome,
-    PoisonReport, PoisonedTx, RetireOutcome, SqlxBroadcastMemory, StorageSqlx, UtxoVerdict,
-    DEFAULT_ABSENCE_MINUTES,
+    PoisonReport, PoisonedTx, ProofToIngest, RetireOutcome, SqlxBroadcastMemory, StorageSqlx,
+    UtxoVerdict, DEFAULT_ABSENCE_MINUTES, INGEST_PROOFS_PER_WRITE,
 };
 
 // Re-export StorageClient when remote feature is enabled
