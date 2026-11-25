@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `createAction` and `processAction` make four fewer trips to the store per action and write the same rows. The step no longer reads back the reference it just generated, and writes the new action's satoshis with its input BEEF in one update instead of two. The process step takes or creates the action's broadcast request in one upsert (`INSERT … ON CONFLICT(txid) DO UPDATE … RETURNING`) instead of a read and a write: a held row keeps its id, history, attempts and `created_at` as before. The send loop uses that request's id and status instead of reading them again, once: a txid named twice reads its row again (`a_held_request_is_taken_over_with_its_history_and_attempts_kept`, `send_with_naming_the_action_itself_reads_its_request_again`, `a_new_actions_row_holds_its_satoshis_beef_and_reference`, each pinned to `main`'s answers).
+
 ### Fixed
 
 - A store's `find_or_insert_user` answers every caller at once for an identity it does not hold (two managers over one store, a wallet and a manager, two tasks of one host): in one write transaction the user's row is inserted only if absent and then read, so every caller is answered the same row, exactly one is told it is new, and that one writes the user's default basket. Before, a caller whose insert followed another's was answered `SQLx error: error returned from database: (code: 2067) UNIQUE constraint failed: users.identity_key` (`callers_at_once_for_one_new_identity_are_all_answered_one_row`).

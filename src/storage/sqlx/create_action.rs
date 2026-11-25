@@ -789,7 +789,7 @@ impl Door<'_> {
         .await?;
 
         // Step 6: Create transaction record in DB
-        let transaction_id = create_transaction_record(&mut tx, user_id, args).await?;
+        let (transaction_id, reference) = create_transaction_record(&mut tx, user_id, args).await?;
 
         // Step 7: Create transaction labels
         if let Some(ref labels) = args.labels {
@@ -851,8 +851,8 @@ impl Door<'_> {
             .sum();
         let satoshis = change_out_sats - change_in_sats;
 
-        // Update transaction with calculated satoshis
-        update_transaction_satoshis(&mut tx, transaction_id, satoshis).await?;
+        // The row's satoshis are written with its input BEEF, below: nothing
+        // in between reads them, and one write of the row saves a trip.
 
         // Step 11: Create output records
         let mut result_outputs = Vec::new();
@@ -1026,9 +1026,6 @@ impl Door<'_> {
             });
         }
 
-        // Get the transaction reference
-        let reference = get_transaction_reference(&mut tx, transaction_id).await?;
-
         // Build input BEEF containing all input transactions with their
         // merkle proofs, from stored bytes, on this transaction's
         // connection; the tracker answers from the pre-check, and the walk
@@ -1058,19 +1055,18 @@ impl Door<'_> {
         }
         let input_beef = built?;
 
-        // Store input_beef in the transaction record (required for process_action)
-        // This matches the TypeScript behavior which stores inputBEEF at transaction creation
-        if let Some(ref beef_bytes) = input_beef {
-            sqlx::query(
-                "UPDATE transactions SET input_beef = ?, updated_at = ? WHERE transaction_id = ?",
-            )
-            .bind(beef_bytes)
-            .bind(Utc::now())
-            .bind(transaction_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(Error::from)?;
-        }
+        // Store the calculated satoshis and input_beef in the transaction
+        // record, in one write (input_beef is required for process_action;
+        // this matches the TypeScript behavior which stores inputBEEF at
+        // transaction creation). With no BEEF the row's input_beef stays
+        // NULL, as it was inserted.
+        update_transaction_satoshis_and_input_beef(
+            &mut tx,
+            transaction_id,
+            satoshis,
+            input_beef.as_deref(),
+        )
+        .await?;
 
         // Build final result
         let created = StorageCreateActionResult {
@@ -1642,7 +1638,7 @@ async fn create_transaction_record(
     conn: &mut SqliteConnection,
     user_id: i64,
     args: &bsv_rs::wallet::CreateActionArgs,
-) -> Result<i64> {
+) -> Result<(i64, String)> {
     let now = Utc::now();
     let reference = random_reference();
     let version = args.version.unwrap_or(1) as i32;
@@ -1664,7 +1660,7 @@ async fn create_transaction_record(
     .execute(&mut *conn)
     .await?;
 
-    Ok(result.last_insert_rowid())
+    Ok((result.last_insert_rowid(), reference))
 }
 
 /// Reads locking script from rawTx in proven_tx_reqs table.
@@ -1723,33 +1719,24 @@ async fn get_locking_script_from_raw_tx(
     )))
 }
 
-/// Gets the reference for a transaction.
-async fn get_transaction_reference(
-    conn: &mut SqliteConnection,
-    transaction_id: i64,
-) -> Result<String> {
-    let row = sqlx::query("SELECT reference FROM transactions WHERE transaction_id = ?")
-        .bind(transaction_id)
-        .fetch_one(&mut *conn)
-        .await?;
-
-    Ok(row.get("reference"))
-}
-
-/// Updates transaction satoshis.
-async fn update_transaction_satoshis(
+/// Writes a new action's satoshis and, when there is one, its input BEEF.
+async fn update_transaction_satoshis_and_input_beef(
     conn: &mut SqliteConnection,
     transaction_id: i64,
     satoshis: i64,
+    input_beef: Option<&[u8]>,
 ) -> Result<()> {
     let now = Utc::now();
 
-    sqlx::query("UPDATE transactions SET satoshis = ?, updated_at = ? WHERE transaction_id = ?")
-        .bind(satoshis)
-        .bind(now)
-        .bind(transaction_id)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "UPDATE transactions SET satoshis = ?, input_beef = COALESCE(?, input_beef), updated_at = ? WHERE transaction_id = ?",
+    )
+    .bind(satoshis)
+    .bind(input_beef)
+    .bind(now)
+    .bind(transaction_id)
+    .execute(&mut *conn)
+    .await?;
 
     Ok(())
 }

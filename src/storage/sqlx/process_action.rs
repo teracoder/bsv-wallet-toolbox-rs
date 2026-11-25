@@ -450,27 +450,24 @@ async fn create_or_update_proven_tx_req(
     let now = Utc::now();
     let notify = format!(r#"{{"transactionIds":[{}]}}"#, transaction_id);
 
-    let existing = sqlx::query("SELECT proven_tx_req_id FROM proven_tx_reqs WHERE txid = ?")
-        .bind(txid)
-        .fetch_optional(&mut *conn)
-        .await?;
-
-    if let Some(row) = existing {
-        let id: i64 = row.get("proven_tx_req_id");
-        sqlx::query(
-            "UPDATE proven_tx_reqs SET status = ?, raw_tx = ?, input_beef = ?, notify = ?, updated_at = ? WHERE proven_tx_req_id = ?",
-        )
-        .bind(status).bind(raw_tx).bind(input_beef).bind(&notify).bind(now).bind(id)
-        .execute(&mut *conn).await?;
-        Ok(id)
-    } else {
-        let result = sqlx::query(
-            "INSERT INTO proven_tx_reqs (txid, status, raw_tx, input_beef, history, notify, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', ?, ?, ?)",
-        )
-        .bind(txid).bind(status).bind(raw_tx).bind(input_beef).bind(&notify).bind(now).bind(now)
-        .execute(&mut *conn).await?;
-        Ok(result.last_insert_rowid())
-    }
+    // One statement (txid is UNIQUE): a new row is inserted with an empty
+    // history; a held row takes the new status, bytes and notify and keeps
+    // its history, attempts and created_at, as the read-then-write did.
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO proven_tx_reqs (txid, status, raw_tx, input_beef, history, notify, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', ?, ?, ?) \
+         ON CONFLICT(txid) DO UPDATE SET status = excluded.status, raw_tx = excluded.raw_tx, input_beef = excluded.input_beef, notify = excluded.notify, updated_at = excluded.updated_at \
+         RETURNING proven_tx_req_id",
+    )
+    .bind(txid)
+    .bind(status)
+    .bind(raw_tx)
+    .bind(input_beef)
+    .bind(&notify)
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(id)
 }
 
 async fn find_proven_tx_req_by_txid(
@@ -611,6 +608,9 @@ pub(super) async fn process_action_writes(
     // The action this write signs (its row id and bytes), which a sent
     // `noSend` transaction's release reads.
     let mut current: Option<(i64, &[u8])> = None;
+    // The request this write just wrote for the action it signs: its id and
+    // status, so the send loop below need not read them back.
+    let mut own_req: Option<(i64, String)> = None;
 
     if args.is_new_tx {
         let reference = args.reference.as_ref().unwrap();
@@ -733,7 +733,7 @@ pub(super) async fn process_action_writes(
             }
         }
 
-        create_or_update_proven_tx_req(
+        let req_id = create_or_update_proven_tx_req(
             &mut *tx,
             txid,
             raw_tx,
@@ -742,6 +742,7 @@ pub(super) async fn process_action_writes(
             found_tx.transaction_id,
         )
         .await?;
+        own_req = Some((req_id, req_status.to_string()));
 
         if args.is_no_send && !args.is_send_with {
             txids_to_broadcast = Vec::new();
@@ -804,7 +805,16 @@ pub(super) async fn process_action_writes(
                 continue;
             }
         }
-        let req = find_proven_tx_req_by_txid(&mut *tx, txid).await?;
+        // The request just written for this action is used once: a txid
+        // named twice (`sendWith` naming the action itself) reads its row
+        // again, as the status write below changed it.
+        let req = match own_req.take() {
+            Some(written) if own == Some(txid.as_str()) => Some(written),
+            held => {
+                own_req = held;
+                find_proven_tx_req_by_txid(&mut *tx, txid).await?
+            }
+        };
 
         if let Some((req_id, current_status)) = req {
             let already_sent = current_status == proven_tx_req_status::UNMINED
@@ -3262,5 +3272,165 @@ mod tests {
             "Error message should contain the detail text: got '{}'",
             msg
         );
+    }
+
+    /// What upstream `main` answers for `sendWith` naming the action itself.
+    fn expected_words(txid: &str) -> Vec<(String, String)> {
+        vec![
+            (txid.to_string(), "sending".to_string()),
+            (txid.to_string(), "sending".to_string()),
+        ]
+    }
+
+    // =========================================================================
+    // Fewer round trips: the same rows as the read-then-write steps wrote
+    // =========================================================================
+
+    async fn req_row(
+        storage: &StorageSqlx,
+        txid: &str,
+    ) -> (i64, String, i64, String, String, Vec<u8>) {
+        sqlx::query_as(
+            "SELECT proven_tx_req_id, status, attempts, history, created_at, raw_tx FROM proven_tx_reqs WHERE txid = ?",
+        )
+        .bind(txid)
+        .fetch_one(storage.pool())
+        .await
+        .unwrap()
+    }
+
+    /// A request the store already holds for the txid (a host's own
+    /// broadcast request, a sync) is taken over by the process step: the new
+    /// status, bytes and notify, its id, history, attempts and created_at
+    /// kept, one row.
+    #[tokio::test]
+    async fn a_held_request_is_taken_over_with_its_history_and_attempts_kept() {
+        let (storage, user_id, reference) = setup_storage_with_action().await;
+        let locking_script =
+            hex::decode("76a914dbc0a7c84983c5bf199b7b2d41b3acf0408ee5aa88ac").unwrap();
+        let raw_tx = create_raw_transaction(&[&locking_script]);
+        let txid = compute_txid(&raw_tx);
+        sqlx::query(
+            "INSERT INTO proven_tx_reqs (txid, status, attempts, history, notified, notify, raw_tx, created_at, updated_at) \
+             VALUES (?, 'unknown', 3, '{\"held\":1}', 0, '{}', X'00', '2020-01-01 00:00:00', '2020-01-01 00:00:00')",
+        )
+        .bind(&txid)
+        .execute(storage.writer())
+        .await
+        .unwrap();
+        let (held_id, ..) = req_row(&storage, &txid).await;
+
+        let args = StorageProcessActionArgs {
+            is_new_tx: true,
+            is_send_with: false,
+            is_no_send: false,
+            is_delayed: false,
+            reference: Some(reference),
+            txid: Some(txid.clone()),
+            raw_tx: Some(raw_tx.clone()),
+            send_with: vec![],
+        };
+        process_action_internal(&storage, user_id, args)
+            .await
+            .unwrap();
+
+        let (id, status, attempts, history, created_at, raw) = req_row(&storage, &txid).await;
+        assert_eq!(id, held_id, "the held row, not a new one");
+        assert_eq!(status, "unsent");
+        assert_eq!(attempts, 4, "the held count, plus the send's");
+        assert_eq!(history, "{\"held\":1}");
+        assert_eq!(created_at, "2020-01-01 00:00:00");
+        assert_eq!(raw, raw_tx);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proven_tx_reqs WHERE txid = ?")
+            .bind(&txid)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// `sendWith` naming the action it signs: the txid is visited twice, and
+    /// the second visit reads the request the first one wrote.
+    #[tokio::test]
+    async fn send_with_naming_the_action_itself_reads_its_request_again() {
+        let (storage, user_id, reference) = setup_storage_with_action().await;
+        let locking_script =
+            hex::decode("76a914dbc0a7c84983c5bf199b7b2d41b3acf0408ee5aa88ac").unwrap();
+        let raw_tx = create_raw_transaction(&[&locking_script]);
+        let txid = compute_txid(&raw_tx);
+
+        let args = StorageProcessActionArgs {
+            is_new_tx: true,
+            is_send_with: true,
+            is_no_send: false,
+            is_delayed: false,
+            reference: Some(reference),
+            txid: Some(txid.clone()),
+            raw_tx: Some(raw_tx),
+            send_with: vec![txid.clone()],
+        };
+        let result = process_action_internal(&storage, user_id, args)
+            .await
+            .unwrap();
+
+        let words: Vec<(String, String)> = result
+            .send_with_results
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.txid, r.status))
+            .collect();
+        assert_eq!(words, expected_words(&txid));
+        let (_, status, attempts, ..) = req_row(&storage, &txid).await;
+        assert_eq!((status.as_str(), attempts), ("unsent", 2));
+    }
+
+    /// The step writes the new action's row once more after inserting it:
+    /// its satoshis and its input BEEF together; the reference answered is
+    /// the row's.
+    #[tokio::test]
+    async fn a_new_actions_row_holds_its_satoshis_beef_and_reference() {
+        let storage = StorageSqlx::in_memory().await.unwrap();
+        storage.migrate("test-wallet", "02test_key").await.unwrap();
+        storage.make_available().await.unwrap();
+        let (user, _) = storage
+            .find_or_insert_user("02user_identity_key")
+            .await
+            .unwrap();
+        seed_change_output(&storage, user.user_id, 100_000).await;
+        let args = bsv_rs::wallet::CreateActionArgs {
+            description: "one row write".to_string(),
+            input_beef: None,
+            inputs: None,
+            outputs: Some(vec![CreateActionOutput {
+                locking_script: hex::decode("76a914dbc0a7c84983c5bf199b7b2d41b3acf0408ee5aa88ac")
+                    .unwrap(),
+                satoshis: 1000,
+                output_description: "output one".to_string(),
+                basket: None,
+                custom_instructions: None,
+                tags: None,
+            }]),
+            lock_time: None,
+            version: None,
+            labels: None,
+            options: None,
+        };
+        let result = storage
+            .create_action(
+                &crate::storage::traits::AuthId::with_user_id("02user_identity_key", user.user_id),
+                args,
+            )
+            .await
+            .unwrap();
+
+        let (satoshis, input_beef): (i64, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT satoshis, input_beef FROM transactions WHERE reference = ?")
+                .bind(&result.reference)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(satoshis, -1040);
+        assert!(input_beef.is_some(), "the input BEEF is stored");
+        assert_eq!(input_beef, result.input_beef);
     }
 }
